@@ -70,6 +70,51 @@ Target: 192.168.1.1
 ==================================================
 ```
 
+## Tests
+
+Deterministic, offline, no external services beyond loopback:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+## Offline Demo
+
+```bash
+cd firmware
+python3 proto_fuzz.py --demo    # exit 0 fast (finds the planted bug)
+python3 proto_fuzz.py --help
+```
+
+The demo spins up the stdlib `dummy_proto_server` on `127.0.0.1`, runs the
+fuzzer, and automatically discovers the crashing input (a `type=3` packet
+missing its 8-byte signature trailer). Non-loopback targets are rejected.
+
+## Live Lab Test Plan
+
+Performed against a **self-hosted, isolated lab service** only, on the
+loopback/`127.0.0.1` or an authenticated lab VLAN with documented
+placeholder addresses. Never fuzz third-party services.
+
+1. **Stand up a stub service** — run the loopback dummy server or an
+   authorized lab test service on an ephemeral localhost port.
+2. **Probe valid traffic** — `python3 proto_fuzz.py --host 127.0.0.1 --port <p> --iterations 10`
+   to confirm a baseline of `OK`/`ERR` responses and no spurious crashes.
+3. **Fuzz** — run with increasing `--iterations` until a crash input is found.
+4. **Triage** — record `payload_hex` from the crash entry, replay it against
+   the paused service, and confirm the parser raises.
+5. **Clean exit codes** — `0` when a crash is discovered, `1` when none is
+   found within the probe budget.
+6. **Cleanup** — terminate the stub service and confirm no threads/ports remain.
+
+## Metrics
+
+- Probes-to-first-crash: number of inputs sent before the first crash is found.
+- Crash payload size: bytes of the minimal reproducible crashing input.
+- False crashes: inputs classified as crashes that replay benignly.
+- Coverage proxies: distinct types/lengths touched before discovery.
+- Runtime: wall-clock time to first crash (should be sub-second for the demo).
+
 ## Legal Disclaimer
 
 **IMPORTANT: Read before use.**

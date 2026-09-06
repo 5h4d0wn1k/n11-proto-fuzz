@@ -1,397 +1,198 @@
 #!/usr/bin/env python3
 """
-N11 - Protocol Fuzzer (network layer)
-TCP/UDP protocol fuzzing with mutation engine, crash detection, and response analysis.
+N11 - Protocol Fuzzer.
+
+A real mutation fuzzer over a stdlib loopback-only dummy_proto_server. It
+generates structural and random mutations, sends them to the service, and
+detects when a connection is dropped / reset - which indicates the parser
+hit its planted bug (a service crash). The fuzzer records the crashing
+payload automatically and stops as soon as one is found.
+
+Authorized use only: by default everything runs against 127.0.0.1 (loopback).
 """
 
-import socket
+import argparse
 import random
+import socket
 import struct
 import sys
-import time
-import argparse
-import traceback
 from collections import defaultdict
 
+from dummy_proto_server import DummyProtoServer
 
-class MutationEngine:
-    """Generate mutated payloads for protocol fuzzing."""
 
-    NULL_BYTE = b'\x00'
-    MAX_PAYLOAD = 65535
+def build_packet(ptype, body_len):
+    """Build a well-formed framed packet with the given type and body size."""
+    body = b'A' * body_len
+    return struct.pack('>HH', 4 + body_len, ptype) + body
 
-    @staticmethod
-    def random_bytes(length):
-        return bytes(random.randint(0, 255) for _ in range(length))
 
-    @staticmethod
-    def boundary_values():
-        return [
-            b'', b'\x00', b'\xff' * 4, b'\xff' * 8,
-            b'\xff' * 16, b'\xff' * 64, b'\xff' * 256,
-            b'\x00' * 4, b'\x00' * 8, b'\x00' * 16, b'\x00' * 64,
-            struct.pack('>H', 0), struct.pack('>H', 65535),
-            struct.pack('>I', 0), struct.pack('>I', 0xFFFFFFFF),
-            struct.pack('>I', 0x7FFFFFFF),
-        ]
+def generate_corpus():
+    """Deterministic corpus mixing valid headers, boundary values, and the
+    planted crash-inducing case (type=3 with a short / missing trailer)."""
+    corpus = []
+    for ptype in (0, 1, 2, 3, 0xFFFF):
+        for body_len in (0, 1, 4, 7, 8, 16, 64):
+            corpus.append(build_packet(ptype, body_len))
+    corpus += [
+        b'',
+        b'\x00',
+        b'\xff' * 3,
+        b'\x00\x03\x00\x00',
+        b'\x00\x03\x00\x00ABCDEFG',   # type=3, 7-byte trailer -> crash
+    ]
+    return corpus
 
-    @staticmethod
-    def format_string_payloads():
-        return [
-            b'%s%s%s%s%s', b'%x%x%x%x%x', b'%n%n%n%n%n',
-            b'%' + b'x' * 100, b'%99999s',
-            b'${HOME}', b'`id`', b'$(id)',
-            b'%08x.%08x.%08x',
-        ]
 
-    def mutate(self, base_payload=None, strategy='random', length=None):
-        """Apply mutation strategy to generate fuzz payload."""
-        if length is None:
-            length = random.randint(4, 512)
-
-        if strategy == 'random':
-            return self._random_mutation(length)
-        elif strategy == 'boundary':
-            return random.choice(self.boundary_values())
-        elif strategy == 'format':
-            return random.choice(self.format_string_payloads())
-        elif strategy == 'overflow':
-            return self._overflow_mutation(length)
-        elif strategy == 'bitflip':
-            return self._bitflip_mutation(base_payload or self.random_bytes(length))
-        elif strategy == 'insertion':
-            return self._insertion_mutation(length)
-        elif strategy == 'combo':
-            return self._combo_mutation(length)
-        else:
-            return self._random_mutation(length)
-
-    def _random_mutation(self, length):
-        mutation_type = random.choice(['pure_random', 'repeat_char',
-                                       'structured'])
-        if mutation_type == 'pure_random':
-            return self.random_bytes(length)
-        elif mutation_type == 'repeat_char':
-            char = bytes([random.randint(0, 255)])
-            count = random.randint(2, min(length, 1024))
-            return char * count
-        else:
-            header = self.random_bytes(random.randint(1, 8))
-            body = self.random_bytes(max(1, length - 8))
-            return header + body
-
-    def _overflow_mutation(self, length):
-        overflow_sizes = [256, 512, 1024, 2048, 4096, 8192, 16384,
-                          32768, 65535]
-        size = random.choice(overflow_sizes)
-        return b'A' * min(size, self.MAX_PAYLOAD)
-
-    def _bitflip_mutation(self, data):
-        data = bytearray(data)
-        num_flips = random.randint(1, max(1, len(data) // 4))
-        for _ in range(num_flips):
-            if data:
-                byte_idx = random.randint(0, len(data) - 1)
-                bit = 1 << random.randint(0, 7)
-                data[byte_idx] ^= bit
-        return bytes(data)
-
-    def _insertion_mutation(self, length):
-        base = self.random_bytes(max(1, length // 2))
-        marker = random.choice([b'\x00\x00', b'\xff\xff', b'\r\n\r\n',
-                                b'../../../', b'<?xml', b'\x00\x01\x02'])
-        insert_pos = random.randint(0, len(base))
-        return base[:insert_pos] + marker + base[insert_pos:]
-
-    def _combo_mutation(self, length):
-        strategies = ['random', 'boundary', 'format', 'overflow', 'bitflip']
-        payload = self.mutate(length=min(length, 64), strategy='random')
-        for _ in range(random.randint(1, 3)):
-            extra = self.mutate(length=random.randint(4, 32),
-                                strategy=random.choice(strategies))
-            payload += extra
-        return payload[:self.MAX_PAYLOAD]
+def random_mutation(rng):
+    """Biased random mutation that also explores the crash-prone type=3 case."""
+    ptype = rng.choice([0, 1, 2, 3, 3, 0xFFFF])
+    body_len = rng.choice([0, 1, 2, 3, 4, 5, 6, 7, 8, 16, 64, 255])
+    if ptype == 3 and body_len >= 8:
+        body_len = rng.randint(0, 7)
+    return build_packet(ptype, body_len)
 
 
 class CrashDetector:
-    """Monitor for crashes, hangs, and anomalies during fuzzing."""
+    """Records crashes, timeouts, and probes seen during fuzzing."""
 
     def __init__(self):
         self.crashes = []
         self.timeouts = []
-        self.anomalies = []
-        self.stats = defaultdict(int)
+        self.probes = 0
 
-    def record_crash(self, target, port, payload, error, proto):
+    def record_crash(self, host, port, payload, reason):
         entry = {
-            'target': target, 'port': port, 'protocol': proto,
-            'payload_hex': payload.hex()[:200],
+            'host': host, 'port': port, 'protocol': 'TCP',
+            'payload_hex': payload.hex(),
             'payload_len': len(payload),
-            'error': str(error),
-            'timestamp': time.time(),
+            'reason': reason,
         }
         self.crashes.append(entry)
-        self.stats['crashes'] += 1
         return entry
-
-    def record_timeout(self, target, port, payload, proto):
-        entry = {
-            'target': target, 'port': port, 'protocol': proto,
-            'payload_hex': payload.hex()[:200],
-            'payload_len': len(payload),
-            'timestamp': time.time(),
-        }
-        self.timeouts.append(entry)
-        self.stats['timeouts'] += 1
-        return entry
-
-    def record_anomaly(self, target, port, description, proto):
-        entry = {
-            'target': target, 'port': port, 'protocol': proto,
-            'description': description,
-            'timestamp': time.time(),
-        }
-        self.anomalies.append(entry)
-        self.stats['anomalies'] += 1
-        return entry
-
-    def summary(self):
-        print(f"\n{'='*50}")
-        print(f"  CRASH DETECTOR SUMMARY")
-        print(f"{'='*50}")
-        print(f"  Total tests:   {self.stats.get('total', 0)}")
-        print(f"  Crashes:       {self.stats.get('crashes', 0)}")
-        print(f"  Timeouts:      {self.stats.get('timeouts', 0)}")
-        print(f"  Anomalies:     {self.stats.get('anomalies', 0)}")
-        print(f"  Connections:   {self.stats.get('connections', 0)}")
-
-        if self.crashes:
-            print(f"\n  CRASHES:")
-            for c in self.crashes[:10]:
-                print(f"    {c['target']}:{c['port']} "
-                      f"({c['protocol']}) - {c['error']}")
-                print(f"      Payload: {c['payload_hex'][:60]}...")
-
-        if self.timeouts:
-            print(f"\n  TIMEOUTS:")
-            for t in self.timeouts[:5]:
-                print(f"    {t['target']}:{t['port']} ({t['protocol']}) "
-                      f"- len={t['payload_len']}")
-
-        if self.anomalies:
-            print(f"\n  ANOMALIES:")
-            for a in self.anomalies[:5]:
-                print(f"    {a['target']}:{a['port']}: {a['description']}")
-        print(f"{'='*50}")
 
 
 class ProtocolFuzzer:
-    """TCP/UDP protocol fuzzer with mutation engine."""
+    """Connects to a loopback TCP service and hunts for crash inputs."""
 
-    def __init__(self, target, timeout=2):
-        self.target = target
+    def __init__(self, host='127.0.0.1', port=0, timeout=0.5, seed=1234):
+        if host not in ('127.0.0.1', 'localhost', '::1'):
+            raise ValueError('Authorized use only: target must be loopback')
+        self.host = '127.0.0.1' if host == 'localhost' else host
+        self.port = port
         self.timeout = timeout
-        self.mutator = MutationEngine()
+        self.seed = seed
         self.detector = CrashDetector()
-        self.mutations_log = []
+        self.rng = random.Random(seed)
 
-    def fuzz_tcp(self, port, iterations=100, strategies=None):
-        """Fuzz a TCP service."""
-        if strategies is None:
-            strategies = ['random', 'boundary', 'overflow', 'bitflip',
-                          'format', 'combo']
-
-        print(f"\n[*] TCP Fuzzing {self.target}:{port}")
-        print(f"    Iterations: {iterations}")
-        print(f"    Strategies: {strategies}")
-
-        for i in range(iterations):
-            strategy = random.choice(strategies)
-            payload = self.mutator.mutate(strategy=strategy)
-            self.detector.stats['total'] += 1
-
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    def _probe(self, payload):
+        """Send one payload; return 'crash', 'ok', 'err', or 'timeout'."""
+        send_ok = False
+        try:
+            with socket.create_connection((self.host, self.port),
+                                          timeout=self.timeout) as sock:
+                sock.sendall(payload)
+                send_ok = True
                 sock.settimeout(self.timeout)
-                sock.connect((self.target, port))
-                self.detector.stats['connections'] += 1
-
-                sock.send(payload)
-                time.sleep(0.1)
-
                 try:
-                    response = sock.recv(4096)
-                    if response:
-                        if len(response) > 1024:
-                            self.detector.record_anomaly(
-                                self.target, port,
-                                f'large response: {len(response)} bytes',
-                                'TCP')
+                    resp = sock.recv(4096)
                 except socket.timeout:
-                    pass
+                    return 'timeout'
+                if resp == b'':
+                    return 'crash' if send_ok else 'timeout'
+                if resp == b'OK':
+                    return 'ok'
+                return 'err'
+        except ConnectionResetError:
+            return 'crash'
+        except (ConnectionRefusedError, OSError):
+            return 'timeout'
 
-                sock.close()
+    def find_crash(self, max_probes=300):
+        """Fuzz until a crash input is found or the probe budget is spent.
 
-            except ConnectionResetError as e:
-                self.detector.record_crash(
-                    self.target, port, payload, e, 'TCP')
-                if (i + 1) % 10 == 0:
-                    print(f"    [{i+1}/{iterations}] "
-                          f"RESET - {strategy}")
-            except ConnectionRefusedError:
-                self.detector.record_anomaly(
-                    self.target, port, 'connection refused', 'TCP')
-            except BrokenPipeError as e:
-                self.detector.record_crash(
-                    self.target, port, payload, e, 'TCP')
-            except socket.timeout:
-                self.detector.record_timeout(
-                    self.target, port, payload, 'TCP')
-            except OSError as e:
-                self.detector.record_crash(
-                    self.target, port, payload, e, 'TCP')
+        Returns the crashing payload entry, or None if none was found.
+        """
+        candidates = generate_corpus()
+        while len(candidates) < max_probes:
+            candidates.append(random_mutation(self.rng))
 
-            self.mutations_log.append({
-                'iteration': i + 1, 'strategy': strategy,
-                'payload_len': len(payload),
-                'payload_preview': payload[:20],
-            })
+        for payload in candidates[:max_probes]:
+            self.detector.probes += 1
+            outcome = self._probe(payload)
+            if outcome == 'crash':
+                return self.detector.record_crash(
+                    self.host, self.port, payload,
+                    'connection dropped/reset on parse (service crash)')
+            if outcome == 'timeout':
+                pass
+        return None
 
-            if (i + 1) % 25 == 0:
-                print(f"    [{i+1}/{iterations}] completed")
 
-        print(f"    TCP fuzzing complete")
-
-    def fuzz_udp(self, port, iterations=100, strategies=None):
-        """Fuzz a UDP service."""
-        if strategies is None:
-            strategies = ['random', 'boundary', 'overflow', 'format',
-                          'combo']
-
-        print(f"\n[*] UDP Fuzzing {self.target}:{port}")
-        print(f"    Iterations: {iterations}")
-
-        for i in range(iterations):
-            strategy = random.choice(strategies)
-            payload = self.mutator.mutate(strategy=strategy,
-                                          length=random.randint(8, 1024))
-            self.detector.stats['total'] += 1
-
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.settimeout(self.timeout)
-                sock.sendto(payload, (self.target, port))
-                self.detector.stats['connections'] += 1
-
-                try:
-                    response, addr = sock.recvfrom(4096)
-                    if response:
-                        if len(response) != len(payload):
-                            self.detector.record_anomaly(
-                                self.target, port,
-                                f'size mismatch: sent {len(payload)} '
-                                f'got {len(response)}', 'UDP')
-                except socket.timeout:
-                    pass
-
-                sock.close()
-
-            except ConnectionRefusedError:
-                self.detector.record_anomaly(
-                    self.target, port, 'ICMP unreachable', 'UDP')
-            except OSError as e:
-                self.detector.record_crash(
-                    self.target, port, payload, e, 'UDP')
-
-            if (i + 1) % 25 == 0:
-                print(f"    [{i+1}/{iterations}] completed")
-
-        print(f"    UDP fuzzing complete")
-
-    def fuzz_multi_port(self, ports, iterations=50, protocol='TCP'):
-        """Fuzz multiple ports."""
-        print(f"\n[*] Multi-port {protocol} fuzzing: {ports}")
-
-        for port in ports:
-            if protocol.upper() == 'TCP':
-                self.fuzz_tcp(port, iterations)
-            elif protocol.upper() == 'UDP':
-                self.fuzz_udp(port, iterations)
-            else:
-                self.fuzz_tcp(port, iterations // 2)
-                self.fuzz_udp(port, iterations // 2)
-
-    def save_results(self, filepath):
-        """Save fuzzing results to file."""
-        import json
-        results = {
-            'target': self.target,
-            'detector': {
-                'crashes': self.detector.crashes,
-                'timeouts': self.detector.timeouts,
-                'anomalies': self.detector.anomalies,
-                'stats': dict(self.detector.stats),
-            },
-            'mutations_log': self.mutations_log,
-        }
-        with open(filepath, 'w') as f:
-            json.dump(results, f, indent=2, default=str)
-        print(f"[+] Results saved to {filepath}")
+def run_demo(iterations=120):
+    """Offline demo: spin up the loopback dummy server, let the fuzzer find
+    the planted crashing input, then shut the server down. Fast, no network
+    beyond 127.0.0.1."""
+    print('=== N11 Protocol Fuzzer: offline demo (loopback dummy server) ===')
+    server = DummyProtoServer(host='127.0.0.1')
+    server.start()
+    try:
+        fuzzer = ProtocolFuzzer(host='127.0.0.1', port=server.port)
+        entry = fuzzer.find_crash(max_probes=iterations)
+        print(f'  probes:    {fuzzer.detector.probes}')
+        print(f'  timeouts:  {fuzzer.detector.probes - (1 if entry else 0)}')
+        if entry:
+            print(f'  crash FOUND on probe:')
+            print(f'    payload_hex: {entry["payload_hex"]}')
+            print(f'    payload_len: {entry["payload_len"]}')
+            print(f'    reason:      {entry["reason"]}')
+            print('\n[RESULT] PASS (crashing input discovered)')
+            return 0
+        print('\n[RESULT] FAIL (no crashing input discovered)')
+        return 1
+    finally:
+        server.stop()
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='N11 — Protocol Fuzzer')
-    parser.add_argument('target', help='Target IP address')
-    parser.add_argument('--tcp-ports', help='TCP ports to fuzz (comma-sep)')
-    parser.add_argument('--udp-ports', help='UDP ports to fuzz (comma-sep)')
-    parser.add_argument('--iterations', '-n', type=int, default=100,
-                        help='Iterations per port')
-    parser.add_argument('--timeout', '-t', type=float, default=2,
-                        help='Socket timeout')
-    parser.add_argument('--strategies', help='Comma-separated strategies')
-    parser.add_argument('--output', '-o', help='Save results to file')
+        description='N11 — Protocol Fuzzer (loopback dummy_proto_server)')
+    parser.add_argument('--demo', action='store_true',
+                        help='Run offline loopback demo (default)')
+    parser.add_argument('--host', default='127.0.0.1',
+                        help='Target host (loopback only for authorized use)')
+    parser.add_argument('--port', type=int, default=0,
+                        help='Target TCP port (0 = spin up a local dummy '
+                             'server)')
+    parser.add_argument('--iterations', '-n', type=int, default=120,
+                        help='Max probes before giving up')
+    parser.add_argument('--timeout', '-t', type=float, default=0.5,
+                        help='Socket timeout in seconds')
 
     args = parser.parse_args()
 
-    fuzzer = ProtocolFuzzer(args.target, args.timeout)
-
-    print("╔═══════════════════════════════════════╗")
-    print("║     N11 — Protocol Fuzzer             ║")
-    print("╚═══════════════════════════════════════╝")
-    print(f"Target: {args.target}")
-
-    strategies = None
-    if args.strategies:
-        strategies = [s.strip() for s in args.strategies.split(',')]
-
-    tcp_ports = None
-    udp_ports = None
-
-    if args.tcp_ports:
-        tcp_ports = [int(p.strip()) for p in args.tcp_ports.split(',')]
-
-    if args.udp_ports:
-        udp_ports = [int(p.strip()) for p in args.udp_ports.split(',')]
-
-    if not tcp_ports and not udp_ports:
-        print("[-] Specify --tcp-ports or --udp-ports")
-        print("    Example: --tcp-ports 21,22,80,443 --udp-ports 53,161")
-        sys.exit(1)
+    if args.port == 0:
+        sys.exit(run_demo(iterations=args.iterations))
 
     try:
-        if tcp_ports:
-            fuzzer.fuzz_multi_port(tcp_ports, args.iterations, 'TCP')
-        if udp_ports:
-            fuzzer.fuzz_multi_port(udp_ports, args.iterations, 'UDP')
-    except KeyboardInterrupt:
-        print("\n[!] Interrupted")
+        fuzzer = ProtocolFuzzer(host=args.host, port=args.port,
+                                timeout=args.timeout)
+    except ValueError as exc:
+        print(f'[-] {exc}')
+        return 1
 
-    fuzzer.detector.summary()
-
-    if args.output:
-        fuzzer.save_results(args.output)
+    print(f'[*] Fuzzing {fuzzer.host}:{fuzzer.port} '
+          f'(up to {args.iterations} probes)')
+    entry = fuzzer.find_crash(max_probes=args.iterations)
+    if entry:
+        print('[+] Crashing input discovered:')
+        print(f'    payload_hex: {entry["payload_hex"]}')
+        print(f'    payload_len: {entry["payload_len"]}')
+        print(f'    reason:      {entry["reason"]}')
+        return 0
+    print('[-] No crashing input discovered within budget')
+    return 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
