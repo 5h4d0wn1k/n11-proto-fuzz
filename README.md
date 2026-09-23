@@ -3,161 +3,71 @@
 > or hold explicit written authorization to assess**. Unauthorized use is
 > prohibited and may be illegal. Read [ETHICS.md](ETHICS.md) and
 > [SCOPE.md](SCOPE.md) before use. Use at your own risk; **AS IS**, no warranty.
+
 # N11 — Protocol Fuzzer
 
-TCP/UDP protocol fuzzing with mutation engine, crash detection, and response analysis.
+Loopback network protocol fuzzer for robustness testing and crash discovery — mutates malformed
+TCP payloads against a local service, detects crashes and timeouts, and records the exact crashing
+input. Standard library only, offline by default.
 
-## Overview
+![MIT](https://img.shields.io/badge/license-MIT-blue.svg)
+![GitHub stars](https://img.shields.io/github/stars/5h4d0wn1k/n11-proto-fuzz)
+![GitHub last commit](https://img.shields.io/github/last-commit/5h4d0wn1k/n11-proto-fuzz)
+![GitHub issues](https://img.shields.io/github/issues/5h4d0wn1k/n11-proto-fuzz)
 
-This project implements a network protocol fuzzer that:
-- Mutates payloads using multiple strategies (random, boundary, overflow, bitflip, format string)
-- Monitors for crashes, timeouts, and anomalous responses
-- Supports both TCP and UDP protocol fuzzing
-- Fuzzes multiple ports simultaneously
-- Logs all mutations and results for analysis
+## Why
+
+Protocol fuzzing finds robustness bugs that unit tests miss: truncated trailers, boundary lengths,
+and malformed type fields. N11 demonstrates the fuzzing loop end-to-end — a deterministic corpus
+mixed with biased random mutations is sent to a TCP service until a crash input is discovered, at
+which point the crashing `payload_hex` is recorded so you can replay and triage it. It is an
+educational network-security and robustness-testing tool, and it is designed to run against
+loopback/`127.0.0.1` or an authorized lab service only — never a third-party host.
 
 ## Features
 
-- **Mutation engine**: 7 strategies including combo mutations
-- **Boundary values**: Tests edge cases (0, 0xFF, max sizes)
-- **Format string**: Tests for format string vulnerabilities
-- **Overflow testing**: Large payloads for buffer overflow detection
-- **Bit flipping**: Subtle mutations for protocol logic bugs
-- **Crash detection**: Records crashes, timeouts, and anomalies
-- **Multi-port**: Fuzz multiple ports in sequence
+- **Crash discovery** — hunts for inputs that drop the connection or reset on parse; records
+  crash, timeout, and OK outcomes per probe.
+- **Deterministic corpus** — valid headers, boundary values, and the planted crash-inducing case
+  (`type=3` with a short missing trailer).
+- **Biased mutation** — seeded RNG explores the crash-prone `type=3` space too.
+- **Local demo server** — `firmware/dummy_proto_server.py` spins up a stdlib loopback service with a
+  planted bug.
+- **Clean exit contract** — `0` when a crash is discovered, `1` when the probe budget is spent.
 
-## Installation
+## Quickstart
 
-No external dependencies — uses only the Python standard library.
-
-## Usage
+Prerequisite: Python 3 (standard library only).
 
 ```bash
-# Fuzz TCP ports
-python3 proto_fuzz.py 192.168.1.1 --tcp-ports 21,22,80,443
-
-# Fuzz UDP ports
-python3 proto_fuzz.py 192.168.1.1 --udp-ports 53,161,123
-
-# Fuzz both with custom iterations and save results
-python3 proto_fuzz.py 192.168.1.1 --tcp-ports 80 --udp-ports 53 \
-    --iterations 200 --output results.json
-
-# Use specific strategies
-python3 proto_fuzz.py 192.168.1.1 --tcp-ports 22 \
-    --strategies boundary,overflow,format
-```
-
-## Example Output
-
-```
-╔═══════════════════════════════════════╗
-║     N11 — Protocol Fuzzer             ║
-╚═══════════════════════════════════════╝
-Target: 192.168.1.1
-
-[*] TCP Fuzzing 192.168.1.1:22
-    Iterations: 100
-    Strategies: ['random', 'boundary', 'overflow', 'bitflip', 'format', 'combo']
-    [25/100] completed
-    [50/100] completed
-    [75/100] completed
-    [100/100] completed
-
-==================================================
-  CRASH DETECTOR SUMMARY
-==================================================
-  Total tests:   100
-  Crashes:       0
-  Timeouts:      3
-  Anomalies:     1
-  Connections:   96
-==================================================
+python3 firmware/proto_fuzz.py --help
+python3 firmware/proto_fuzz.py --demo            # spin up loopback server, find the planted bug
+python3 firmware/proto_fuzz.py --host 127.0.0.1 --port 9000 --iterations 200
+python3 firmware/proto_fuzz.py --host 127.0.0.1 --port 9000 --iterations 100 --timeout 0.5
 ```
 
 ## Tests
-
-Deterministic, offline, no external services beyond loopback:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-## Offline Demo
+## Project structure
 
-```bash
-cd firmware
-python3 proto_fuzz.py --demo    # exit 0 fast (finds the planted bug)
-python3 proto_fuzz.py --help
-```
+- `firmware/proto_fuzz.py` — fuzzer, crash detector, and CLI.
+- `firmware/dummy_proto_server.py` — the loopback stub service used by the demo.
+- `tests/` — stdlib unittest suite.
 
-The demo spins up the stdlib `dummy_proto_server` on `127.0.0.1`, runs the
-fuzzer, and automatically discovers the crashing input (a `type=3` packet
-missing its 8-byte signature trailer). Non-loopback targets are rejected.
+## Documentation
 
-## Live Lab Test Plan
+- [CONTRIBUTING.md](CONTRIBUTING.md)
+- [SECURITY.md](SECURITY.md)
+- [ETHICS.md](ETHICS.md) · [SCOPE.md](SCOPE.md)
 
-Performed against a **self-hosted, isolated lab service** only, on the
-loopback/`127.0.0.1` or an authenticated lab VLAN with documented
-placeholder addresses. Never fuzz third-party services.
+## Contributing
 
-1. **Stand up a stub service** — run the loopback dummy server or an
-   authorized lab test service on an ephemeral localhost port.
-2. **Probe valid traffic** — `python3 proto_fuzz.py --host 127.0.0.1 --port <p> --iterations 10`
-   to confirm a baseline of `OK`/`ERR` responses and no spurious crashes.
-3. **Fuzz** — run with increasing `--iterations` until a crash input is found.
-4. **Triage** — record `payload_hex` from the crash entry, replay it against
-   the paused service, and confirm the parser raises.
-5. **Clean exit codes** — `0` when a crash is discovered, `1` when none is
-   found within the probe budget.
-6. **Cleanup** — terminate the stub service and confirm no threads/ports remain.
-
-## Metrics
-
-- Probes-to-first-crash: number of inputs sent before the first crash is found.
-- Crash payload size: bytes of the minimal reproducible crashing input.
-- False crashes: inputs classified as crashes that replay benignly.
-- Coverage proxies: distinct types/lengths touched before discovery.
-- Runtime: wall-clock time to first crash (should be sub-second for the demo).
-
-## Legal Disclaimer
-
-**IMPORTANT: Read before use.**
-
-This project is provided for **educational and authorized security testing purposes only**.
-
-### Authorization Requirements
-- You MUST have explicit written permission from the network owner before using this tool
-- Unauthorized interception of network communications is illegal under federal and state laws
-- This tool should ONLY be used on networks you own or have written authorization to test
-
-### Legal Framework
-- **Computer Fraud and Abuse Act (CFAA)**: Unauthorized access to computer systems is a federal crime
-- **Wiretap Act (18 U.S.C. § 2511)**: Interception of electronic communications without consent is illegal
-- **State Laws**: Many states have additional computer crime and wiretapping statutes
-- **GDPR/CCPA**: Data collection may be subject to privacy regulations
-
-### Acceptable Use
-- Testing security of your own networks
-- Authorized penetration testing with written scope
-- Academic research in controlled lab environments
-- Security education and training
-
-### Prohibited Use
-- Intercepting communications on networks you do not own
-- Attacking infrastructure without authorization
-- Any activity that violates applicable laws or regulations
-- Commercial use without proper licensing
-
-### No Warranty
-This software is provided "AS IS" without warranty of any kind. The author is not responsible for any misuse or damage caused by this software.
-
-### Responsible Disclosure
-If you discover vulnerabilities using this tool, follow responsible disclosure practices:
-1. Report to the vendor/owner privately
-2. Allow reasonable time for remediation
-3. Do not exploit beyond proof of concept
+See [CONTRIBUTING.md](CONTRIBUTING.md). Keep experiments loopback-only and the sampler reproducible.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
